@@ -1,0 +1,2 @@
+class WatcherState:
+    running = True

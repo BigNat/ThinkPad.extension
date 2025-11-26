@@ -1,0 +1,411 @@
+INDEX
+=====
+
+commands\export_sheets_to_cad.py
+commands\export_sheets_to_json.py
+commands\start_watching.py
+commands\stop_watching.py
+commands\test_command.py
+dispatch_command.py
+script.py
+watcher_state.py
+──────────────────────────────────────────────────────────────────────
+################################################################################
+### commands\export_sheets_to_cad.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os, json, clr
+from pyrevit import forms
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    BuiltInCategory,
+    ViewSheet,
+    DWGExportOptions,
+    DXFExportOptions,
+    ElementId
+)
+
+# Import List for proper ICollection conversion
+clr.AddReference("System")
+from System.Collections.Generic import List
+
+
+def run(uiapp, data, log):
+    """Exports selected Revit sheets to DWG or DXF."""
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+
+        # Extract parameters
+        sheet_ids = data.get("sheet_ids", [])
+        cad_format = data.get("cad_format", "dwg").lower()
+        export_path = data.get("path", r"C:\PADApps\RevitPAD\Exports")
+
+        if not os.path.exists(export_path):
+            os.makedirs(export_path)
+
+        log("Starting export_sheets_to_cad -> {0}".format(export_path))
+        log("Format: {0} | Sheets: {1}".format(cad_format, len(sheet_ids)))
+
+        # Choose export options
+        if cad_format == "dxf":
+            options = DXFExportOptions()
+        else:
+            options = DWGExportOptions()
+
+
+        # Prevent Xrefs and separate files
+        try: 
+            options.ExportViewsAsExternalReferences = False
+        except: 
+            pass
+
+        # Merge all sheet views into a single DWG
+        try:
+            options.MergedViews = True
+        except:
+            pass
+
+        # Prevent coordinates/export splitting
+        try:
+            options.SharedCoords = False
+        except:
+            pass
+
+        # Prevent Revit from exporting parts of sheets separately
+        try:
+            options.ExportingAreas = False
+        except:
+            pass
+
+        # Collect target sheets
+        all_sheets = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Sheets)
+        # If sheet_ids is empty, export everything
+        if not sheet_ids:
+            export_sheets = all_sheets
+        else:
+            export_sheets = [s for s in all_sheets if s.Id.IntegerValue in sheet_ids]
+
+        if not export_sheets:
+            msg = "⚠️ No matching sheets found for export."
+            log(msg)
+            forms.alert(msg, title="Revit Command Watcher")
+            return
+
+        # Export loop
+        exported = []
+        for sheet in export_sheets:
+            try:
+                sheetnum = sheet.SheetNumber
+                sheetname = sheet.Name
+
+                # Build safe filename (no f-strings allowed)
+                combined = "{0}_{1}".format(sheetnum, sheetname)
+                safe_name = "".join([c for c in combined if c.isalnum() or c in ("_", "-")])
+
+                views = List[ElementId]([sheet.Id])  # ICollection[ElementId]
+                result = doc.Export(export_path, safe_name, views, options)
+
+                if result:
+                    file_path = os.path.join(export_path, safe_name + "." + cad_format)
+                    exported.append(file_path)
+                    log("Exported: {0}".format(file_path))
+
+            except Exception as e:
+                log("Failed to export sheet {0}: {1}".format(sheet.SheetNumber, e))
+
+        msg = "Export complete: {0} files exported to\n{1}".format(len(exported), export_path)
+        log(msg)
+        forms.alert(msg, title="Revit Command Watcher")
+
+    except Exception as e:
+        log("Error in export_sheets_to_cad: {0}".format(e))
+
+################################################################################
+### commands\export_sheets_to_json.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os, json
+from Autodesk.Revit.DB import FilteredElementCollector, BuiltInCategory
+
+def run(uiapp, data, log):
+    doc = uiapp.ActiveUIDocument.Document
+
+    base_dir = os.path.dirname(data.get("watch_path", ""))
+    out_file = os.path.join(base_dir, "revit_sheets.json")
+
+    sheets = []
+    for s in FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Sheets):
+        sheets.append({
+            "id": s.Id.IntegerValue,
+            "sheet_number": s.SheetNumber,
+            "sheet_name": s.Name
+        })
+
+    # IronPython-friendly file write
+    with open(out_file, "wb") as f:
+        txt = json.dumps({"sheets": sheets}, indent=2, ensure_ascii=False)
+        f.write(txt.encode("utf-8"))
+
+    # IronPython-safe logging
+    log("Exported {0} sheets.".format(len(sheets)))
+
+    return {"status": "ok", "count": len(sheets)}
+
+################################################################################
+### commands\start_watching.py
+################################################################################
+def run(uiapp, data, log):
+    from watcher_state import WatcherState
+    WatcherState.running = True
+    log("Watcher started.")
+    return {"status": "watcher_started"}
+
+################################################################################
+### commands\stop_watching.py
+################################################################################
+def run(uiapp, data, log):
+    from watcher_state import WatcherState
+    WatcherState.running = False
+    log("Watcher stopped.")
+    return {"status": "watcher_stopped"}
+
+################################################################################
+### commands\test_command.py
+################################################################################
+def run(uiapp, data, log):
+    log("Test command running.")
+    return {"status": "ok", "message": "Hello from Revit"}
+
+################################################################################
+### dispatch_command.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+import json
+import time
+import importlib
+import sys
+from pyrevit import forms
+from Autodesk.Revit.UI import IExternalEventHandler
+
+from watcher_state import WatcherState
+
+
+class CommandDispatcher(IExternalEventHandler):
+    """Receives ExternalEvent, reads JSON, dispatches commands, writes results."""
+
+    def __init__(self, watch_path, log_path, result_path):
+        self.watch_path = watch_path
+        self.last_command = None
+        self.log_path = log_path
+        self.result_path = result_path
+        self.commands_dir = os.path.join(os.path.dirname(__file__), "commands")
+
+        if self.commands_dir not in sys.path:
+            sys.path.append(self.commands_dir)
+
+        self.log("=== Dispatcher initialised ===")
+        self.log("WatchPath: {0}".format(self.watch_path))
+        self.log("ResultPath: {0}".format(self.result_path))
+        self.log("CommandsDir: {0}".format(self.commands_dir))
+        self.log("================================")
+
+    # ----------------------------------------------------------------------
+    def log(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        try:
+            with open(self.log_path, "ab") as f:
+                line = "[{0}] {1}\n".format(ts, msg)
+                f.write(line.encode("utf-8", "replace"))
+        except:
+            pass
+
+    # ----------------------------------------------------------------------
+    def Execute(self, uiapp):
+        """Called by Revit ExternalEvent system."""
+        try:
+            self.log("Execute() fired. Checking JSON...")
+            if not os.path.exists(self.watch_path):
+                self.log("Watch path missing. Nothing to do.")
+                return
+
+            size = os.path.getsize(self.watch_path)
+            self.log("JSON file size: {0} bytes".format(size))
+
+            # Read JSON ----------------------------------------------------------------
+            try:
+                with open(self.watch_path, "r") as f:
+                    data = json.load(f)
+                self.log("JSON read OK.")
+            except Exception as e:
+                self.log("ERROR reading JSON: {0}".format(e))
+                return
+
+            cmd = data.get("command", "").strip()
+            self.log("Command field: '{0}'".format(cmd))
+
+            # No command?
+            if not cmd:
+                self.log("No command found. Returning.")
+                return
+
+            # Same command as last time?
+            if cmd == self.last_command:
+                self.log("Skipping: same command as last time ('{0}').".format(cmd))
+                return
+
+            # NEW command
+            self.log("NEW COMMAND detected: {0}".format(cmd))
+            self.last_command = cmd
+
+            # Dispatch it
+            self.dispatch(uiapp, cmd, data)
+
+        except Exception as e:
+            self.log("Dispatcher error in Execute: {0}".format(e))
+
+    # ----------------------------------------------------------------------
+    def dispatch(self, uiapp, cmd, data):
+        """Load module, call run(), write results."""
+        start_ts = time.time()
+        self.log("Dispatching '{0}'...".format(cmd))
+
+        try:
+            # Import -----------------------------------------------------------------
+            self.log("Importing module: {0}".format(cmd))
+            module = importlib.import_module(cmd)
+
+            module_path = getattr(module, "__file__", "UNKNOWN")
+            self.log("Module loaded from: {0}".format(module_path))
+
+            # Reload -----------------------------------------------------------------
+            try:
+                reload(module)
+                self.log("Module reloaded successfully.")
+            except Exception as e:
+                self.log("Module reload warning: {0}".format(e))
+
+            # Run Command -------------------------------------------------------------
+            if hasattr(module, "run"):
+                self.log("Executing run() in '{0}'...".format(cmd))
+                result = module.run(uiapp, data, self.log)
+                self.log("run() finished.")
+                self.write_result(result)
+                self.log("Command completed OK: {0}".format(cmd))
+            else:
+                self.log("ERROR: No run() in module '{0}'".format(cmd))
+
+        except Exception as e:
+            self.log("Dispatch ERROR for '{0}': {1}".format(cmd, e))
+
+        finally:
+            # Clear JSON --------------------------------------------------------------
+            try:
+                with open(self.watch_path, "w") as f:
+                    f.write("{}")
+                self.log("Command file cleared.")
+            except Exception as e:
+                self.log("Failed to clear command file: {0}".format(e))
+
+            elapsed = time.time() - start_ts
+            self.log("Dispatch ended. Duration: {0:.3f}s".format(elapsed))
+
+    # ----------------------------------------------------------------------
+    def write_result(self, result):
+        """Write the result JSON returned by the module."""
+        try:
+            self.log("Writing result to: {0}".format(self.result_path))
+            with open(self.result_path, "w") as f:
+                json.dump(result or {"status": "ok"}, f, indent=2)
+            self.log("Result written successfully.")
+        except Exception as e:
+            self.log("Failed to write result file: {0}".format(e))
+
+    # ----------------------------------------------------------------------
+    def GetName(self):
+        return "Command Dispatcher"
+
+################################################################################
+### script.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+import time
+import json
+import threading
+from pyrevit import forms
+from Autodesk.Revit.UI import ExternalEvent
+
+from dispatch_command import CommandDispatcher
+from watcher_state import WatcherState
+
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+BRIDGE_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Bridge")
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+LOG_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Logs")
+
+WATCH_PATH = os.path.join(BRIDGE_FOLDER, "revit_command.json")
+RESULT_PATH = os.path.join(BRIDGE_FOLDER, "revit_result.json")
+LOG_PATH = os.path.join(LOG_FOLDER, "revit_pad_log.txt")
+
+def ensure_files():
+    folder = os.path.dirname(WATCH_PATH)
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    if not os.path.exists(WATCH_PATH):
+        open(WATCH_PATH, "w").write("{}")
+
+    if not os.path.exists(RESULT_PATH):
+        open(RESULT_PATH, "w").write("{}")
+
+
+def start_watcher(dispatcher, ext_event):
+    """Background polling loop. Raises Revit ExternalEvent when a command appears."""
+    time.sleep(1)
+    dispatcher.log("Watcher loop started.")
+
+    while WatcherState.running:
+        try:
+            ext_event.Raise()
+        except:
+            pass
+
+        time.sleep(0.25)
+
+    dispatcher.log("Watcher loop stopped.")
+
+
+def main():
+    ensure_files()
+
+    dispatcher = CommandDispatcher(
+        watch_path=WATCH_PATH, 
+        log_path=LOG_PATH, 
+        result_path=RESULT_PATH
+        )
+    
+    ext_event = ExternalEvent.Create(dispatcher)
+
+    WatcherState.running = True
+
+    t = threading.Thread(target=start_watcher, args=(dispatcher, ext_event))
+    t.daemon = True
+    t.start()
+
+    forms.alert(
+        "Revit–BlueTree link established.\n\n"
+        "Watcher is running.\n"
+        "BlueTree may now send commands.",
+        title="Command Link Active"
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+################################################################################
+### watcher_state.py
+################################################################################
+class WatcherState:
+    running = True

@@ -1,0 +1,369 @@
+INDEX
+=====
+
+commands\export_sheets_to_cad.py
+commands\export_sheets_to_json.py
+commands\test_command.py
+CommandWatcherHelper.py
+script.py
+──────────────────────────────────────────────────────────────────────
+################################################################################
+### commands\export_sheets_to_cad.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os, json, clr
+from pyrevit import forms
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    BuiltInCategory,
+    ViewSheet,
+    DWGExportOptions,
+    DXFExportOptions,
+    ElementId
+)
+
+# Import List for proper ICollection conversion
+clr.AddReference("System")
+from System.Collections.Generic import List
+
+
+def run(uiapp, data, log):
+    """Exports selected Revit sheets to DWG or DXF."""
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+
+        # Extract parameters
+        sheet_ids = data.get("sheet_ids", [])
+        cad_format = data.get("cad_format", "dwg").lower()
+        export_path = data.get("path", r"C:\PADApps\RevitPAD\Exports")
+
+        if not os.path.exists(export_path):
+            os.makedirs(export_path)
+
+        log("Starting export_sheets_to_cad -> {0}".format(export_path))
+        log("Format: {0} | Sheets: {1}".format(cad_format, len(sheet_ids)))
+
+        # Choose export options
+        if cad_format == "dxf":
+            options = DXFExportOptions()
+        else:
+            options = DWGExportOptions()
+
+
+        # Prevent Xrefs and separate files
+        try: 
+            options.ExportViewsAsExternalReferences = False
+        except: 
+            pass
+
+        # Merge all sheet views into a single DWG
+        try:
+            options.MergedViews = True
+        except:
+            pass
+
+        # Prevent coordinates/export splitting
+        try:
+            options.SharedCoords = False
+        except:
+            pass
+
+        # Prevent Revit from exporting parts of sheets separately
+        try:
+            options.ExportingAreas = False
+        except:
+            pass
+
+        # Collect target sheets
+        all_sheets = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Sheets)
+        # If sheet_ids is empty, export everything
+        if not sheet_ids:
+            export_sheets = all_sheets
+        else:
+            export_sheets = [s for s in all_sheets if s.Id.IntegerValue in sheet_ids]
+
+        if not export_sheets:
+            msg = "⚠️ No matching sheets found for export."
+            log(msg)
+            forms.alert(msg, title="Revit Command Watcher")
+            return
+
+        # Export loop
+        exported = []
+        for sheet in export_sheets:
+            try:
+                sheetnum = sheet.SheetNumber
+                sheetname = sheet.Name
+
+                # Build safe filename (no f-strings allowed)
+                combined = "{0}_{1}".format(sheetnum, sheetname)
+                safe_name = "".join([c for c in combined if c.isalnum() or c in ("_", "-")])
+
+                views = List[ElementId]([sheet.Id])  # ICollection[ElementId]
+                result = doc.Export(export_path, safe_name, views, options)
+
+                if result:
+                    file_path = os.path.join(export_path, safe_name + "." + cad_format)
+                    exported.append(file_path)
+                    log("Exported: {0}".format(file_path))
+
+            except Exception as e:
+                log("Failed to export sheet {0}: {1}".format(sheet.SheetNumber, e))
+
+        msg = "Export complete: {0} files exported to\n{1}".format(len(exported), export_path)
+        log(msg)
+        forms.alert(msg, title="Revit Command Watcher")
+
+    except Exception as e:
+        log("Error in export_sheets_to_cad: {0}".format(e))
+
+################################################################################
+### commands\export_sheets_to_json.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os, json
+from pyrevit import forms
+from Autodesk.Revit.DB import FilteredElementCollector, BuiltInCategory
+
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+
+
+
+def run(uiapp, data, log):
+    """Exports all Revit sheets to JSON file."""
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+        base_dir = DATA_FOLDER
+        output_path = os.path.join(base_dir, "data.json")
+
+        sheets = []
+        for s in FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Sheets):
+            try:
+                sheets.append({
+                    "id": s.Id.IntegerValue,
+                    "sheet_number": s.SheetNumber,
+                    "sheet_name": s.Name
+                })
+            except Exception:
+                pass
+
+        with open(output_path, "wb") as f:
+            txt = json.dumps({"sheets": sheets}, indent=2, ensure_ascii=False)
+            f.write(txt.encode("utf-8"))
+
+        msg = "✅ Exported {0} sheets → {1}".format(len(sheets), output_path)
+        log(msg)
+        forms.alert(msg, title="Revit Command Watcher")
+
+    except Exception as e:
+        log("Error in export_sheets_to_json: {0}".format(e))
+
+################################################################################
+### commands\test_command.py
+################################################################################
+
+from Autodesk.Revit.UI import TaskDialog
+
+def run(uiapp, data, log):
+    try:
+        log("Running TEST COMMAND")
+        TaskDialog.Show("Test Command", "Test command executed successfully.")  
+        log("Test command completed.")
+    except Exception as e:
+        log("Test command error: {0}".format(e))
+
+################################################################################
+### CommandWatcherHelper.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+import sys
+import time
+import threading
+import json
+import importlib
+from pyrevit import forms
+from Autodesk.Revit.UI import IExternalEventHandler
+
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+BRIDGE_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Bridge")
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+LOG_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Logs")
+
+class CommandWatcherHandler(IExternalEventHandler):
+    """Revit command dispatcher that dynamically loads command modules."""
+
+    def __init__(self, watch_path):
+        self.uiapp_cached = None 
+        self.event_pending = False
+        self.watch_path = watch_path
+        self.last_mod_time = None
+        self.last_command = None
+
+
+        self.keep_running = True
+        base_dir = os.path.dirname(watch_path)
+        self.commands_dir = os.path.join(os.path.dirname(__file__), "commands")
+
+
+
+
+        self.log_path = os.path.join(LOG_FOLDER, "revit_pad_log.txt")
+
+        # Ensure commands directory is in import path
+        if self.commands_dir not in sys.path:
+            sys.path.append(self.commands_dir)
+
+    def log(self, msg):
+        try:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(self.log_path, "ab") as f:
+                f.write(u"[{0}] {1}\n".format(ts, msg).encode("utf-8", "replace"))
+        except Exception:
+            pass
+
+    def Execute(self, uiapp):
+
+        try:
+            if not os.path.exists(self.watch_path):
+                return
+            
+            if os.path.getsize(self.watch_path) < 5:
+                return
+                
+            if self.uiapp_cached is None:
+                self.uiapp_cached = uiapp
+                self.log("Cached UIApplication")
+
+            mod_time = os.path.getmtime(self.watch_path)
+            if mod_time == self.last_mod_time:
+                return
+            self.last_mod_time = mod_time
+
+            # --- wait for writer to finish ---
+            for _ in range(10):
+                if os.path.getsize(self.watch_path) > 5:
+                    break
+                time.sleep(0.05)
+
+            
+
+            with open(self.watch_path, "r") as f:
+                data = json.load(f)
+
+            cmd = data.get("command", "").strip()
+            if not cmd or cmd == self.last_command:
+                return
+
+            self.last_command = cmd
+            self.log("Command received: {0}".format(cmd))
+            self.run_command(cmd, uiapp, data)
+
+        except Exception as e:
+            self.log("Error in Execute: {0}".format(e))
+
+        finally:
+            self.event_pending = False
+
+
+    def run_command(self, cmd, uiapp, data):
+        try:
+            module_name = cmd.replace("-", "_")
+
+            self.log("IMPORTING: {0}".format(module_name))
+            module = importlib.import_module(module_name)
+
+            self.log("LOADED FROM: {0}".format(getattr(module, "__file__", "UNKNOWN")))
+
+            # IronPython reload (Python 2 syntax)
+            try:
+                reload(module)
+            except Exception as e:
+                self.log("Reload warning: {0}".format(e))
+
+            if hasattr(module, "run"):
+                data["watch_path"] = self.watch_path
+                module.run(uiapp, data, self.log)
+
+                # NEW: clear file to stop repeats
+                try:
+                    with open(self.watch_path, "w") as f:
+                        f.write("{}")
+                    self.log("Command cleared from JSON file.")
+                except:
+                    self.log("Failed to clear command file.")
+
+        except Exception as e:
+            self.log("⚠ Command failed ({0}): {1}".format(cmd, e))
+            forms.alert("⚠ Command failed:\n{0}\n\n{1}".format(cmd, e),
+                        title="Command Watcher")
+
+
+    def GetName(self):
+        return "Command Watcher Event"
+
+    def start(self, ext_event, interval=3):
+
+        def loop():
+            time.sleep(5)
+            self.log("Command Watcher active.")
+
+            while self.keep_running:
+                if not self.event_pending:
+                    self.event_pending = True
+                    try:
+                        ext_event.Raise()
+                    except:
+                        self.event_pending = False
+
+                time.sleep(interval)
+
+        t = threading.Thread(target=loop)
+        t.daemon = True
+        t.start()
+
+################################################################################
+### script.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+from pyrevit import forms
+from Autodesk.Revit.UI import ExternalEvent
+
+from CommandWatcherHelper import CommandWatcherHandler
+
+
+
+
+__title__ = "👀 Command Watcher"
+__doc__ = "Background watcher for file modifications using ExternalEvent."
+
+WATCH_PATH = r"C:\PADApps\RevitPAD\Bridge\revit_command.json"
+
+
+def main():
+    if not os.path.exists(WATCH_PATH):
+        folder = os.path.dirname(WATCH_PATH)
+        if not os.path.exists(folder):
+            os.makedirs(folder)
+        open(WATCH_PATH, "w").close()
+
+    handler = CommandWatcherHandler(WATCH_PATH)
+    ext_event = ExternalEvent.Create(handler)
+
+    handler.start(ext_event)
+
+    forms.alert(
+        "👀 Command Watcher started.\n\n"
+        "Watching for file edits at:\n\n{0}\n\n"
+        "Logs will be written to:\n{1}\n\n"
+        "Close Revit to stop the watcher.".format(
+            WATCH_PATH, handler.log_path
+        ),
+        title="Command Watcher",
+    )
+
+
+if __name__ == "__main__":
+    main()
