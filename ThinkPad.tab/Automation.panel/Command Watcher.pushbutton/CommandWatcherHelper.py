@@ -27,6 +27,7 @@ class CommandWatcherHandler(IExternalEventHandler):
         self.keep_running = True
         base_dir = os.path.dirname(watch_path)
         self.commands_dir = os.path.join(os.path.dirname(__file__), "commands")
+        self.requests_dir = os.path.join(os.path.dirname(__file__), "requests")
 
 
 
@@ -74,7 +75,7 @@ class CommandWatcherHandler(IExternalEventHandler):
             with open(self.watch_path, "r") as f:
                 data = json.load(f)
 
-            cmd = data.get("command", "").strip()
+            cmd = (data.get("command") or data.get("request") or "").strip()
             if not cmd or cmd == self.last_command:
                 return
 
@@ -90,6 +91,8 @@ class CommandWatcherHandler(IExternalEventHandler):
 
 
     def run_command(self, cmd, uiapp, data):
+        
+
         try:
             if cmd == "stop_watcher":
                 self.log("Received stop_watcher command. Stopping loop.")
@@ -118,6 +121,13 @@ class CommandWatcherHandler(IExternalEventHandler):
 
 
             module_name = cmd.replace("-", "_")
+
+            if "request" in data:
+                module_path = self.requests_dir
+            else:
+                module_path = self.commands_dir
+
+            sys.path.append(module_path)
 
             self.log("IMPORTING: {0}".format(module_name))
             module = importlib.import_module(module_name)
