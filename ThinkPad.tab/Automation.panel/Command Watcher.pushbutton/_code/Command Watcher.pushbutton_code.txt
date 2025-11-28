@@ -2,9 +2,15 @@ INDEX
 =====
 
 commands\export_sheets_to_cad.py
-commands\export_sheets_to_json.py
+commands\export_sheets_to_pdf.py
+commands\open_view_by_id.py
 commands\test_command.py
 CommandWatcherHelper.py
+requests\get_3d_views.py
+requests\get_active_view.py
+requests\get_all_views.py
+requests\get_model_path.py
+requests\get_sheet_data.py
 script.py
 ──────────────────────────────────────────────────────────────────────
 ################################################################################
@@ -118,46 +124,178 @@ def run(uiapp, data, log):
         log("Error in export_sheets_to_cad: {0}".format(e))
 
 ################################################################################
-### commands\export_sheets_to_json.py
+### commands\export_sheets_to_pdf.py
 ################################################################################
 # -*- coding: utf-8 -*-
-import os, json
+import os
+import json
 from pyrevit import forms
-from Autodesk.Revit.DB import FilteredElementCollector, BuiltInCategory
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    BuiltInCategory,
+    PrintRange
+)
+
+PDF_DRIVER = "PDFCreator"
 
 REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
 DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+RESPONSE_PATH = os.path.join(DATA_FOLDER, "response.json")
 
+
+def write_response(payload, log):
+    """Write ONLY error responses from Revit."""
+    try:
+        if not os.path.exists(DATA_FOLDER):
+            os.makedirs(DATA_FOLDER)
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump(payload, f, indent=2)
+        log("Response.json written.")
+    except Exception as e:
+        log("ERROR writing response.json: {}".format(e))
 
 
 def run(uiapp, data, log):
-    """Exports all Revit sheets to JSON file."""
+    """
+    Export sheets to PDF.
+    NOTE:
+        • NO success response is written.
+        • BlueTree will detect, move, and write the final response.
+    """
     try:
-        doc = uiapp.ActiveUIDocument.Document
-        base_dir = DATA_FOLDER
-        output_path = os.path.join(base_dir, "data.json")
+        uidoc = uiapp.ActiveUIDocument
+        doc = uidoc.Document
 
-        sheets = []
-        for s in FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Sheets):
-            try:
-                sheets.append({
-                    "id": s.Id.IntegerValue,
-                    "sheet_number": s.SheetNumber,
-                    "sheet_name": s.Name
-                })
-            except Exception:
-                pass
+        # ---------------------------------------------------
+        # Incoming request data
+        # ---------------------------------------------------
+        sheet_ids = data.get("sheet_ids", [])
+        export_path = data.get("path", r"C:\PADApps\RevitPAD\ExportsPDF")
 
-        with open(output_path, "wb") as f:
-            txt = json.dumps({"sheets": sheets}, indent=2, ensure_ascii=False)
-            f.write(txt.encode("utf-8"))
+        if not os.path.exists(export_path):
+            os.makedirs(export_path)
 
-        msg = "✅ Exported {0} sheets → {1}".format(len(sheets), output_path)
-        log(msg)
-        forms.alert(msg, title="Revit Command Watcher")
+        if not sheet_ids:
+            msg = "No sheet_ids passed to export_sheets_to_pdf"
+            log(msg)
+            write_response({"error": msg}, log)
+            return
+
+        log("PRINT-CURRENT-WINDOW mode started")
+        log("Sheet IDs received: {}".format(sheet_ids))
+
+        # ---------------------------------------------------
+        # Collect matching sheets
+        # ---------------------------------------------------
+        collector = (
+            FilteredElementCollector(doc)
+            .OfCategory(BuiltInCategory.OST_Sheets)
+            .WhereElementIsNotElementType()
+        )
+
+        sheets = [s for s in collector if s.Id.IntegerValue in sheet_ids]
+
+        if not sheets:
+            msg = "No valid sheets found for provided IDs."
+            log(msg)
+            write_response({"error": msg}, log)
+            return
+
+        # ---------------------------------------------------
+        # Configure PDF print driver
+        # ---------------------------------------------------
+        pm = doc.PrintManager
+        pm.SelectNewPrintDriver(PDF_DRIVER)
+        pm.PrintToFile = True
+        pm.PrintRange = PrintRange.Current
+
+        # ---------------------------------------------------
+        # Loop — one sheet per file
+        # (PDFCreator overrides the filename)
+        # ---------------------------------------------------
+        for sheet in sheets:
+            log("→ Activating sheet {}".format(sheet.SheetNumber))
+
+            uidoc.ActiveView = sheet
+
+            num = sheet.SheetNumber
+            name = sheet.Name
+            combined = "{}_{}".format(num, name)
+            safe = "".join([c for c in combined if c.isalnum() or c in ("_", "-")])
+
+            out_file = os.path.join(export_path, safe + ".pdf")
+            log("→ Printing to: {}".format(out_file))
+
+            pm.PrintToFileName = out_file
+            pm.Apply()
+            pm.SubmitPrint()
+
+            log("✔ Printed (PDFCreator may rename): {}".format(out_file))
+
+        # ---------------------------------------------------
+        # IMPORTANT:
+        # NO SUCCESS RESPONSE WRITTEN HERE.
+        # BlueTree detects and moves the files,
+        # then generates the REAL response with correct paths.
+        # ---------------------------------------------------
 
     except Exception as e:
-        log("Error in export_sheets_to_json: {0}".format(e))
+        err = "PDF Export error: {}".format(e)
+        log(err)
+        write_response({"error": err}, log)
+
+################################################################################
+### commands\open_view_by_id.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+import json
+from Autodesk.Revit.DB import ElementId
+
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+RESPONSE_PATH = os.path.join(DATA_FOLDER, "response.json")
+
+
+def run(uiapp, data, log):
+    """
+    Opens a view in Revit by its element ID.
+    """
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+        view_id_int = data.get("id")
+
+        if not view_id_int:
+            raise Exception("Missing 'id' field for open-view-by-id")
+
+        # Correct creation of ElementId
+        eid = ElementId(view_id_int)
+        view_elem = doc.GetElement(eid)
+
+        if not view_elem:
+            raise Exception("No view found with id {0}".format(view_id_int))
+
+        # Switch active view
+        uiapp.ActiveUIDocument.ActiveView = view_elem
+
+        result = {
+            "status": "ok",
+            "opened_view_id": view_id_int,
+            "opened_view_name": view_elem.Name
+        }
+
+        if not os.path.exists(DATA_FOLDER):
+            os.makedirs(DATA_FOLDER)
+
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump(result, f, indent=2)
+
+        log("Opened view id {0}: {1}".format(view_id_int, view_elem.Name))
+
+    except Exception as e:
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump({"error": str(e)}, f, indent=2)
+        log("Error in open_view_by_id: {0}".format(e))
 
 ################################################################################
 ### commands\test_command.py
@@ -205,6 +343,7 @@ class CommandWatcherHandler(IExternalEventHandler):
         self.keep_running = True
         base_dir = os.path.dirname(watch_path)
         self.commands_dir = os.path.join(os.path.dirname(__file__), "commands")
+        self.requests_dir = os.path.join(os.path.dirname(__file__), "requests")
 
 
 
@@ -252,7 +391,7 @@ class CommandWatcherHandler(IExternalEventHandler):
             with open(self.watch_path, "r") as f:
                 data = json.load(f)
 
-            cmd = data.get("command", "").strip()
+            cmd = (data.get("command") or data.get("request") or "").strip()
             if not cmd or cmd == self.last_command:
                 return
 
@@ -268,8 +407,43 @@ class CommandWatcherHandler(IExternalEventHandler):
 
 
     def run_command(self, cmd, uiapp, data):
+        
+
         try:
+            if cmd == "stop_watcher":
+                self.log("Received stop_watcher command. Stopping loop.")
+
+                # Remove the lock file
+                try:
+                    os.remove(os.path.join(BRIDGE_FOLDER, "watcher.lock"))
+                    self.log("Watcher lock file removed.")
+                except:
+                    pass
+
+                # Clear the command file to prevent reprocessing
+                try:
+                    with open(self.watch_path, "w") as f:
+                        f.write("{}")
+                    self.log("stop_watcher cleared from JSON file.")
+                except:
+                    self.log("Failed to clear stop_watcher from JSON file.")
+
+                # Reset last command so nothing lingers
+                self.last_command = None
+
+                # Stop the loop
+                self.keep_running = False
+                return
+
+
             module_name = cmd.replace("-", "_")
+
+            if "request" in data:
+                module_path = self.requests_dir
+            else:
+                module_path = self.commands_dir
+
+            sys.path.append(module_path)
 
             self.log("IMPORTING: {0}".format(module_name))
             module = importlib.import_module(module_name)
@@ -294,6 +468,8 @@ class CommandWatcherHandler(IExternalEventHandler):
                 except:
                     self.log("Failed to clear command file.")
 
+                self.last_command = None
+
         except Exception as e:
             self.log("⚠ Command failed ({0}): {1}".format(cmd, e))
             forms.alert("⚠ Command failed:\n{0}\n\n{1}".format(cmd, e),
@@ -309,7 +485,20 @@ class CommandWatcherHandler(IExternalEventHandler):
             time.sleep(5)
             self.log("Command Watcher active.")
 
-            while self.keep_running:
+            while True:
+                if not self.keep_running:
+                    self.log("Watcher loop exiting cleanly.")
+                    return  # <-- EXIT THREAD IMMEDIATELY
+
+                # HEARTBEAT
+                try:
+                    heartbeat_path = os.path.join(BRIDGE_FOLDER, "revit_heartbeat.json")
+                    with open(heartbeat_path, "w") as hb:
+                        hb.write(json.dumps({"timestamp": time.time(), "status": "alive"}))
+                except:
+                    pass
+
+                # Raise events
                 if not self.event_pending:
                     self.event_pending = True
                     try:
@@ -317,11 +506,294 @@ class CommandWatcherHandler(IExternalEventHandler):
                     except:
                         self.event_pending = False
 
-                time.sleep(interval)
+                # Short sleep for responsive shutdown
+                for _ in range(30):   # 30 × 0.1s = 3 seconds total
+                    if not self.keep_running:
+                        self.log("Watcher loop stopping during sleep.")
+                        return
+                    time.sleep(0.1)
+
 
         t = threading.Thread(target=loop)
         t.daemon = True
         t.start()
+
+################################################################################
+### requests\get_3d_views.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+import json
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    View3D
+)
+
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+RESPONSE_PATH = os.path.join(DATA_FOLDER, "response.json")
+
+
+def run(uiapp, data, log):
+    """
+    Returns all 3D views in the current Revit document.
+    Includes id, name, view type, and perspective flag.
+    """
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+
+        if not os.path.exists(DATA_FOLDER):
+            os.makedirs(DATA_FOLDER)
+
+        views = []
+        collector = FilteredElementCollector(doc).OfClass(View3D)
+
+        for v in collector:
+            try:
+                # Skip templates
+                if v.IsTemplate:
+                    continue
+
+                views.append({
+                    "id": v.Id.IntegerValue,
+                    "name": v.Name,
+                    "is_perspective": bool(v.IsPerspective),
+                    "view_type": str(v.ViewType)
+                })
+            except Exception:
+                pass
+
+        result = {"views": views}
+
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump(result, f, indent=2)
+
+        log("Returned 3D views: {0}".format(len(views)))
+
+    except Exception as e:
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump({"error": str(e)}, f, indent=2)
+        log("Error in get_3d_views: {0}".format(e))
+
+################################################################################
+### requests\get_active_view.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+import json
+
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+RESPONSE_PATH = os.path.join(DATA_FOLDER, "response.json")
+
+
+def run(uiapp, data, log):
+    """
+    Returns information about the current active view in Revit.
+    """
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+        view = doc.ActiveView
+
+        if not os.path.exists(DATA_FOLDER):
+            os.makedirs(DATA_FOLDER)
+
+        result = {
+            "view_name": view.Name,
+            "view_id": view.Id.IntegerValue,
+            "view_type": str(view.ViewType)
+        }
+
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump(result, f, indent=2)
+
+        log("Returned active view information: {0}".format(view.Name))
+
+    except Exception as e:
+        # Return error in response.json
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump({"error": str(e)}, f, indent=2)
+        log("Error in get_active_view: {0}".format(e))
+
+################################################################################
+### requests\get_all_views.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+import json
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    View
+)
+
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+RESPONSE_PATH = os.path.join(DATA_FOLDER, "response.json")
+
+
+def run(uiapp, data, log):
+    """
+    Returns ALL non-template views in the model.
+    Grouped by general view type.
+    """
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+
+        if not os.path.exists(DATA_FOLDER):
+            os.makedirs(DATA_FOLDER)
+
+        # Prepare container for grouping
+        views_by_type = {}
+
+        collector = FilteredElementCollector(doc).OfClass(View)
+
+        for v in collector:
+            try:
+                if v.IsTemplate:
+                    continue
+
+                vtype = str(v.ViewType)
+
+                if vtype not in views_by_type:
+                    views_by_type[vtype] = []
+
+                views_by_type[vtype].append({
+                    "id": v.Id.IntegerValue,
+                    "name": v.Name,
+                    "view_type": vtype
+                })
+
+            except Exception:
+                pass
+
+        result = {"views": views_by_type}
+
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump(result, f, indent=2)
+
+        log("Returned all views grouped by type.")
+
+    except Exception as e:
+        # Return error
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump({"error": str(e)}, f, indent=2)
+
+        log("Error in get_all_views: {0}".format(e))
+
+################################################################################
+### requests\get_model_path.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os, json
+from Autodesk.Revit.DB import ModelPathUtils
+
+DATA_FOLDER = r"C:\PADApps\RevitPAD\Data"
+RESPONSE = os.path.join(DATA_FOLDER, "response.json")
+
+def run(uiapp, data, log):
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+
+        # Get absolute model path
+        model_path = doc.PathName
+
+        # Detect parent folder
+        parent = os.path.dirname(model_path) if model_path else ""
+
+        result = {
+            "model_path": model_path,
+            "parent_folder": parent,
+        }
+
+        # Persist response
+        if not os.path.exists(DATA_FOLDER):
+            os.makedirs(DATA_FOLDER)
+
+        with open(RESPONSE, "w") as f:
+            json.dump(result, f, indent=2)
+
+        log("Returned model path → {0}".format(model_path))
+
+    except Exception as e:
+        log("Error in get_model_path: {0}".format(e))
+
+################################################################################
+### requests\get_sheet_data.py
+################################################################################
+# -*- coding: utf-8 -*-
+import os
+import json
+from Autodesk.Revit.DB import (
+    FilteredElementCollector,
+    BuiltInCategory,
+    BuiltInParameter,
+    Revision
+)
+
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+RESPONSE_PATH = os.path.join(DATA_FOLDER, "response.json")
+
+
+def run(uiapp, data, log):
+    """
+    Request handler: returns all Revit sheets and revision metadata.
+    Writes output to response.json for BlueTree to read.
+    """
+    try:
+        doc = uiapp.ActiveUIDocument.Document
+
+        if not os.path.exists(DATA_FOLDER):
+            os.makedirs(DATA_FOLDER)
+
+        sheets_out = []
+
+        collector = FilteredElementCollector(doc).OfCategory(
+            BuiltInCategory.OST_Sheets
+        )
+
+        for s in collector:
+            try:
+                # --- Current revision number ---
+                rev_param = s.get_Parameter(BuiltInParameter.SHEET_CURRENT_REVISION)
+                current_rev_num = rev_param.AsString() if rev_param else None
+                if not current_rev_num:
+                    current_rev_num = None
+
+                rev_desc = None
+                rev_date = None
+
+                # --- Match the Revision element ---
+                if current_rev_num:
+                    for rev_id in s.GetAllRevisionIds():
+                        rev = doc.GetElement(rev_id)
+                        if isinstance(rev, Revision) and rev.RevisionNumber == current_rev_num:
+                            rev_desc = rev.Description
+                            rev_date = rev.RevisionDate
+                            break
+
+                sheets_out.append({
+                    "id": s.Id.IntegerValue,
+                    "sheet_number": s.SheetNumber,
+                    "sheet_name": s.Name,
+                    "revision_number": current_rev_num,
+                    "revision_description": rev_desc,
+                    "revision_date": rev_date
+                })
+
+            except Exception:
+                pass
+
+        # --- Write request result ---
+        result = {"sheets": sheets_out}
+
+        with open(RESPONSE_PATH, "w") as f:
+            json.dump(result, f, indent=2)
+
+        log("Returned sheet data: {0} sheets".format(len(sheets_out)))
+
+    except Exception as e:
+        log("Error in get_sheet_data: {0}".format(e))
 
 ################################################################################
 ### script.py
@@ -338,8 +810,9 @@ from CommandWatcherHelper import CommandWatcherHandler
 
 __title__ = "👀 Command Watcher"
 __doc__ = "Background watcher for file modifications using ExternalEvent."
-
-WATCH_PATH = r"C:\PADApps\RevitPAD\Bridge\revit_command.json"
+BRIDGE_FOLDER = r"C:\PADApps\RevitPAD\Bridge"
+WATCH_PATH = os.path.join(BRIDGE_FOLDER, "revit_command.json")
+LOCK_FILE = os.path.join(BRIDGE_FOLDER, "watcher.lock")
 
 
 def main():
@@ -348,6 +821,13 @@ def main():
         if not os.path.exists(folder):
             os.makedirs(folder)
         open(WATCH_PATH, "w").close()
+
+    if os.path.exists(LOCK_FILE):
+        forms.alert("Command Watcher is already running.", title="Watcher Already Active")
+        return
+    
+    with open(LOCK_FILE, "w") as f:
+        f.write("running")
 
     handler = CommandWatcherHandler(WATCH_PATH)
     ext_event = ExternalEvent.Create(handler)

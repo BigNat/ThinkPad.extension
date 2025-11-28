@@ -16,7 +16,7 @@ RESPONSE_PATH = os.path.join(DATA_FOLDER, "response.json")
 
 
 def write_response(payload, log):
-    """Write ONLY error responses from Revit."""
+    """Safe writer for the Revit response.json."""
     try:
         if not os.path.exists(DATA_FOLDER):
             os.makedirs(DATA_FOLDER)
@@ -29,10 +29,7 @@ def write_response(payload, log):
 
 def run(uiapp, data, log):
     """
-    Export sheets to PDF.
-    NOTE:
-        • NO success response is written.
-        • BlueTree will detect, move, and write the final response.
+    Export sheets to PDF and write a RevitPAD response.json
     """
     try:
         uidoc = uiapp.ActiveUIDocument
@@ -81,15 +78,18 @@ def run(uiapp, data, log):
         pm.PrintToFile = True
         pm.PrintRange = PrintRange.Current
 
+        exported = []
+
         # ---------------------------------------------------
         # Loop — one sheet per file
-        # (PDFCreator overrides the filename)
         # ---------------------------------------------------
         for sheet in sheets:
             log("→ Activating sheet {}".format(sheet.SheetNumber))
 
+            # Activate sheet
             uidoc.ActiveView = sheet
 
+            # Make filename
             num = sheet.SheetNumber
             name = sheet.Name
             combined = "{}_{}".format(num, name)
@@ -102,14 +102,20 @@ def run(uiapp, data, log):
             pm.Apply()
             pm.SubmitPrint()
 
-            log("✔ Printed (PDFCreator may rename): {}".format(out_file))
+            log("✔ Printed: {}".format(out_file))
+            exported.append(out_file)
 
         # ---------------------------------------------------
-        # IMPORTANT:
-        # NO SUCCESS RESPONSE WRITTEN HERE.
-        # BlueTree detects and moves the files,
-        # then generates the REAL response with correct paths.
+        # Write success response
         # ---------------------------------------------------
+        payload = {
+            "status": "ok",
+            "exported_count": len(exported),
+            "exported_files": exported
+        }
+
+        write_response(payload, log)
+        log("PDF Export complete → {} files".format(len(exported)))
 
     except Exception as e:
         err = "PDF Export error: {}".format(e)
