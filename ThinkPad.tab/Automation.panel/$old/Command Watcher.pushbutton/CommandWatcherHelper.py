@@ -8,6 +8,10 @@ import importlib
 from pyrevit import forms
 from Autodesk.Revit.UI import IExternalEventHandler
 
+REVIT_PAD_FOLDER = r"C:\PADApps\RevitPAD"
+BRIDGE_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Bridge")
+DATA_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Data")
+LOG_FOLDER = os.path.join(REVIT_PAD_FOLDER, "Logs")
 
 class CommandWatcherHandler(IExternalEventHandler):
     """Revit command dispatcher that dynamically loads command modules."""
@@ -18,10 +22,17 @@ class CommandWatcherHandler(IExternalEventHandler):
         self.watch_path = watch_path
         self.last_mod_time = None
         self.last_command = None
+
+
         self.keep_running = True
         base_dir = os.path.dirname(watch_path)
         self.commands_dir = os.path.join(os.path.dirname(__file__), "commands")
-        self.log_path = os.path.join(base_dir, "revit_command_log.txt")
+        self.requests_dir = os.path.join(os.path.dirname(__file__), "requests")
+
+
+
+
+        self.log_path = os.path.join(LOG_FOLDER, "revit_pad_log.txt")
 
         # Ensure commands directory is in import path
         if self.commands_dir not in sys.path:
@@ -64,7 +75,7 @@ class CommandWatcherHandler(IExternalEventHandler):
             with open(self.watch_path, "r") as f:
                 data = json.load(f)
 
-            cmd = data.get("command", "").strip()
+            cmd = (data.get("command") or data.get("request") or "").strip()
             if not cmd or cmd == self.last_command:
                 return
 
@@ -80,8 +91,43 @@ class CommandWatcherHandler(IExternalEventHandler):
 
 
     def run_command(self, cmd, uiapp, data):
+        
+
         try:
+            if cmd == "stop_watcher":
+                self.log("Received stop_watcher command. Stopping loop.")
+
+                # Remove the lock file
+                try:
+                    os.remove(os.path.join(BRIDGE_FOLDER, "watcher.lock"))
+                    self.log("Watcher lock file removed.")
+                except:
+                    pass
+
+                # Clear the command file to prevent reprocessing
+                try:
+                    with open(self.watch_path, "w") as f:
+                        f.write("{}")
+                    self.log("stop_watcher cleared from JSON file.")
+                except:
+                    self.log("Failed to clear stop_watcher from JSON file.")
+
+                # Reset last command so nothing lingers
+                self.last_command = None
+
+                # Stop the loop
+                self.keep_running = False
+                return
+
+
             module_name = cmd.replace("-", "_")
+
+            if "request" in data:
+                module_path = self.requests_dir
+            else:
+                module_path = self.commands_dir
+
+            sys.path.append(module_path)
 
             self.log("IMPORTING: {0}".format(module_name))
             module = importlib.import_module(module_name)
@@ -106,6 +152,8 @@ class CommandWatcherHandler(IExternalEventHandler):
                 except:
                     self.log("Failed to clear command file.")
 
+                self.last_command = None
+
         except Exception as e:
             self.log("⚠ Command failed ({0}): {1}".format(cmd, e))
             forms.alert("⚠ Command failed:\n{0}\n\n{1}".format(cmd, e),
@@ -121,7 +169,20 @@ class CommandWatcherHandler(IExternalEventHandler):
             time.sleep(5)
             self.log("Command Watcher active.")
 
-            while self.keep_running:
+            while True:
+                if not self.keep_running:
+                    self.log("Watcher loop exiting cleanly.")
+                    return  # <-- EXIT THREAD IMMEDIATELY
+
+                # HEARTBEAT
+                try:
+                    heartbeat_path = os.path.join(BRIDGE_FOLDER, "revit_heartbeat.json")
+                    with open(heartbeat_path, "w") as hb:
+                        hb.write(json.dumps({"timestamp": time.time(), "status": "alive"}))
+                except:
+                    pass
+
+                # Raise events
                 if not self.event_pending:
                     self.event_pending = True
                     try:
@@ -129,7 +190,13 @@ class CommandWatcherHandler(IExternalEventHandler):
                     except:
                         self.event_pending = False
 
-                time.sleep(interval)
+                # Short sleep for responsive shutdown
+                for _ in range(30):   # 30 × 0.1s = 3 seconds total
+                    if not self.keep_running:
+                        self.log("Watcher loop stopping during sleep.")
+                        return
+                    time.sleep(0.1)
+
 
         t = threading.Thread(target=loop)
         t.daemon = True

@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
 from pyrevit import forms
 from Autodesk.Revit.UI import ExternalEvent
 
+# ----------------------------------------------------------------------
+# BOOTSTRAP: ensure PADApps\RevitPAD is importable
+# ----------------------------------------------------------------------
+PAD_ROOT = r"C:\PADApps\RevitPAD\Core"
+if PAD_ROOT not in sys.path:
+    sys.path.insert(0, PAD_ROOT)
+
 from CommandWatcherHelper import CommandWatcherHandler
-
-
-
 
 __title__ = "👀 Command Watcher"
 __doc__ = "Background watcher for file modifications using ExternalEvent."
-BRIDGE_FOLDER = r"C:\PADApps\RevitPAD\Bridge"
-WATCH_PATH = os.path.join(BRIDGE_FOLDER, "revit_command.json")
-LOCK_FILE = os.path.join(BRIDGE_FOLDER, "watcher.lock")
+
+WATCH_PATH = r"C:\PADApps\RevitPAD\Bridge\revit_command.json"
 
 
 def main():
@@ -21,13 +25,6 @@ def main():
         if not os.path.exists(folder):
             os.makedirs(folder)
         open(WATCH_PATH, "w").close()
-
-    if os.path.exists(LOCK_FILE):
-        forms.alert("Command Watcher is already running.", title="Watcher Already Active")
-        return
-    
-    with open(LOCK_FILE, "w") as f:
-        f.write("running")
 
     handler = CommandWatcherHandler(WATCH_PATH)
     ext_event = ExternalEvent.Create(handler)
